@@ -34,6 +34,124 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+def _supervisor_path_allowlist_match(
+*,
+    function_name: str,
+    action: str,
+    function_args: Dict[str, Any],
+    entries: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the matching supervisor path-allowlist entry's details, else None.
+
+    Fail-closed in every direction: any missing/malformed field, any failed
+    check, or any uncertainty yields None (gate blocks). A non-None return is a
+    deliberate, fully-validated allowance for ONE write_file under ONE
+    time-boxed, byte-capped, prefix-contained allowlist entry.
+
+    Hardened invariants:
+      * Containment uses resolve()+relative_to() (component-wise), so '..'
+        traversal, symlink escape, and 'prefix-as-substring' siblings
+        (/staging/lorenzo-evil vs /staging/lorenzo) are all rejected.
+      * expires_at is REQUIRED -- no standing grants.
+      * max_bytes_per_file is REQUIRED and enforced -- no silent uncapped writes.
+      * A hardcoded forbid floor (.env, config.yaml, AGENTS.md, SOUL.md) is
+        denied by basename even if an entry forgets its own forbid_targets.
+      * Only write_file is handled today; other tools fail closed until their
+        arg-shape gets an explicit handler.
+    """
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    ALWAYS_FORBID = {".env", "config.yaml", "config.yml", "AGENTS.md", "SOUL.md"}
+
+    if not isinstance(entries, list):
+        return None
+    if not isinstance(function_args, dict):
+        return None
+    if function_name != "write_file":
+        return None
+    if action != "edit_handler":
+        return None
+
+    raw_path = function_args.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+
+    content = function_args.get("content", "")
+    if isinstance(content, bytes):
+        payload_bytes = len(content)
+    elif isinstance(content, str):
+        payload_bytes = len(content.encode("utf-8"))
+    else:
+        payload_bytes = len(str(content).encode("utf-8"))
+
+    target_path = Path(raw_path).expanduser().resolve(strict=False)
+    target_name = target_path.name
+    now = datetime.now(timezone.utc)
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("enabled", False) is not True:
+            continue
+        if function_name not in set(entry.get("tools") or []):
+            continue
+        if action not in set(entry.get("actions") or []):
+            continue
+
+        expires_at = entry.get("expires_at")
+        if not expires_at:
+            continue
+        try:
+            expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires <= now:
+            continue
+
+        max_bytes = entry.get("max_bytes_per_file")
+        try:
+            max_bytes = int(max_bytes)
+        except (TypeError, ValueError):
+            continue
+        if max_bytes <= 0:
+            continue
+        if payload_bytes > max_bytes:
+            continue
+
+        entry_forbid = entry.get("forbid_targets") or []
+        if not isinstance(entry_forbid, list):
+            entry_forbid = []
+        forbid = ALWAYS_FORBID | {str(x) for x in entry_forbid}
+        if target_name in forbid:
+            continue
+
+        prefix = entry.get("path_prefix")
+        if not isinstance(prefix, str) or not prefix:
+            continue
+        prefix_path = Path(prefix).expanduser().resolve(strict=False)
+        try:
+            rel = target_path.relative_to(prefix_path)
+        except ValueError:
+            continue
+        if rel == Path("."):
+            continue
+
+        return {
+            "initiative_id": entry.get("initiative_id"),
+            "target_paths": [raw_path],
+            "resolved_path": str(target_path),
+            "path_prefix": str(prefix_path),
+            "max_bytes_per_file": max_bytes,
+            "payload_bytes": payload_bytes,
+            "reason": entry.get("reason", ""),
+        }
+
+    return None
+
+
 
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
@@ -568,6 +686,374 @@ def _resolve_active_context_length() -> int:
 # so if something slips through, the LLM sees a sensible message.
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+
+# Supervisor gate is wired but disabled by default.  When enabled, only tools
+# mapped to MEDIUM/HIGH risk are sent to the external supervisor; clearly-safe
+# read/concierge actions stay on the fast path.
+_SUPERVISOR_GATE_ENV = "SUPERVISOR_GATE_ENABLED"
+_SUPERVISOR_IMPORT_PATH_ENV = "SUPERVISOR_IMPORT_PATH"
+_SUPERVISOR_PATH_ALLOWLIST_ENV = "SUPERVISOR_PATH_ALLOWLIST"
+_DEFAULT_SUPERVISOR_IMPORT_PATHS = (
+    "/home/transversed/hermes_supervisor",
+    "/home/transversed/hermes_supervisor/hermes_supervisor",
+)
+
+# Hermes tool name -> supervisor action key.  The action keys are deliberately
+# the existing supervisor.RISK_TABLE vocabulary; risk_for(action) determines
+# whether the gate actually runs.
+_SUPERVISOR_TOOL_ACTION_MAP = {
+    "terminal": "run_command",              # arbitrary shell command execution
+    "execute_code": "run_command",          # arbitrary Python can spawn/mutate directly
+    "write_file": "edit_handler",
+    "patch": "edit_handler",
+    "skill_manage": "wire_tool",
+    "cronjob": "wire_tool",                 # durable autonomous behavior
+    "mcp_higgsfield_deploy_game": "deploy",
+    "mcp_higgsfield_publish_game": "deploy",
+    "mcp_higgsfield_confirm_billing_purchase": "external_send",
+    "mcp_era_billing__confirm_subscription_change": "external_send",
+    "mcp_era_billing__upgrade": "external_send",
+    "mcp_era_billing__cancel_subscription": "external_send",
+    "mcp_era_billing__uncancel_subscription": "external_send",
+    "mcp_era_connections__disconnect_institution": "delete",
+    "mcp_era_accounts__manage_account": "edit_config",
+    "mcp_era_accounts__set_account_visibility": "edit_config",
+    "mcp_era_transactions__update_transactions": "edit_config",
+    "mcp_era_transactions__manage_manual_transaction": "edit_config",
+    "mcp_era_transactions__import_csv_transactions": "migrate_data",
+    "mcp_era_transactions__manage_automation_rules": "wire_tool",
+    "mcp_era_transactions__manage_categories": "edit_config",
+    "mcp_era_transactions__manage_transaction_tags": "edit_config",
+    "mcp_era_transactions__manage_transfer_links": "edit_config",
+    "mcp_era_knowledge__remember": "edit_config",
+    "mcp_era_knowledge__forget": "delete",
+    "mcp_era_knowledge__reset_pack_questions": "edit_config",
+}
+
+# Explicit fast-path safe tools.  This includes read-only tools, normal
+# messaging/clarification surfaces, and concierge/research surfaces whose normal
+# use is informational rather than mutating local files, config, money, or infra.
+_SUPERVISOR_SAFE_TOOL_NAMES = {
+    "read_file", "search_files", "web_search", "web_extract",
+    "browser_snapshot", "browser_get_images", "browser_console",
+    "browser_vision", "browser_navigate", "browser_back", "browser_scroll",
+    "session_search", "todo", "clarify", "send_message", "text_to_speech",
+    "vision_analyze", "image_generate", "skills_list", "skill_view",
+    "mcp_era_accounts__list_financial_accounts",
+    "mcp_era_accounts__check_account_balance",
+    "mcp_era_accounts__manage_account_groups",
+    "mcp_era_insights__analyze_spending",
+    "mcp_era_insights__compare_spending_periods",
+    "mcp_era_insights__forecast_spending",
+    "mcp_era_insights__get_cash_flow",
+    "mcp_era_insights__get_daily_financial_summary",
+    "mcp_era_transactions__list_transactions",
+    "mcp_era_transactions__search_transactions",
+    "mcp_era_transactions__list_spending_categories",
+    "mcp_era_transactions__list_recurring_charges",
+    "mcp_era_billing__get_current_plan",
+    "mcp_era_billing__list_plans",
+    "mcp_era_billing__manage",
+    "mcp_era_billing__preview_subscription_change",
+    "mcp_era_help__get_help",
+    "mcp_era_knowledge__get_financial_context_and_overview",
+    "mcp_era_knowledge__get_pending_questions",
+    "mcp_era_knowledge__recall_history",
+    "mcp_era_referral__get_referral_link",
+    "mcp_era_referral__get_referral_stats",
+    "mcp_higgsfield_balance", "mcp_higgsfield_transactions",
+    "mcp_higgsfield_models_explore", "mcp_higgsfield_job_status",
+    "mcp_higgsfield_job_display", "mcp_higgsfield_show_generations",
+    "mcp_higgsfield_show_medias", "mcp_higgsfield_animation_actions",
+    "mcp_higgsfield_list_workspaces", "mcp_higgsfield_show_plans_and_credits",
+    "mcp_higgsfield_personal_clipper_jobs", "mcp_higgsfield_personal_clipper_status",
+    "mcp_higgsfield_video_analysis_jobs", "mcp_higgsfield_video_analysis_status",
+    "mcp_higgsfield_presets_show", "mcp_higgsfield_show_marketing_studio",
+    "mcp_higgsfield_show_reference_elements", "mcp_higgsfield_show_characters",
+}
+
+_SUPERVISOR_SAFE_PREFIXES = (
+    "mcp_era_insights__",
+    "mcp_era_help__",
+    "mcp_era_list_",
+    "mcp_era_read_",
+    "mcp_higgsfield_list_",
+    "mcp_higgsfield_read_",
+)
+
+_SUPERVISOR_HIGH_RISK_NAME_FRAGMENTS = (
+    "deploy", "publish", "confirm_billing", "upgrade", "cancel_subscription",
+    "disconnect", "delete", "remove", "import_csv", "manage_", "update_",
+    "set_account", "trigger_connection_resync", "join_referral_program",
+    "switch_referral_campaign", "generate_", "motion_control", "outpaint",
+    "reframe", "upscale", "remove_background", "reveal_generation",
+    "select_workspace", "sync_agents", "virality_predictor",
+)
+
+
+def _supervisor_gate_enabled() -> bool:
+    value = os.getenv(_SUPERVISOR_GATE_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _supervisor_load_path_allowlist() -> List[Dict[str, Any]]:
+    """Load optional path-scoped supervisor allowlist entries from JSON env."""
+    raw = os.getenv(_SUPERVISOR_PATH_ALLOWLIST_ENV, "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _supervisor_append_decision(record: Dict[str, Any]) -> None:
+    """Best-effort JSONL audit for wrapper-level fail-closed outcomes."""
+    try:
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        default_path = Path.home() / "hermes_supervisor" / "gate_decisions.log"
+        path = Path(os.getenv("SUPERVISOR_GATE_DECISIONS_LOG", str(default_path))).expanduser()
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "model_tools.handle_function_call",
+            **record,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        logger.warning("failed to append supervisor wrapper decision log: %s", exc)
+
+
+def _supervisor_block_result(
+    *,
+    function_name: str,
+    action: str,
+    risk: str,
+    reason: str,
+    verdict: str = "BLOCK",
+) -> str:
+    return json.dumps({
+        "error": (
+            f"BLOCKED by supervisor gate ({reason}). Tool {function_name!r} "
+            "was not executed."
+        ),
+        "status": "blocked",
+        "supervisor_gate": {
+            "enabled": True,
+            "tool": function_name,
+            "action": action,
+            "risk": risk,
+            "verdict": verdict,
+            "reason": reason,
+        },
+    }, ensure_ascii=False)
+
+
+def _supervisor_import_modules():
+    """Import supervisor/gate modules lazily so disabled mode has no dependency."""
+    import sys
+
+    raw_path = os.getenv(_SUPERVISOR_IMPORT_PATH_ENV, "")
+    for part in raw_path.split(os.pathsep):
+        if part and part not in sys.path:
+            sys.path.insert(0, part)
+    for part in _DEFAULT_SUPERVISOR_IMPORT_PATHS:
+        if part and part not in sys.path:
+            sys.path.insert(0, part)
+
+    try:
+        from hermes_supervisor import supervisor as supervisor_mod
+        from hermes_supervisor import gate as gate_mod
+    except Exception:
+        import supervisor as supervisor_mod  # type: ignore
+        import gate as gate_mod  # type: ignore
+    return supervisor_mod, gate_mod
+
+
+def _supervisor_action_for_tool(function_name: str, supervisor_mod=None) -> tuple[str, Any] | tuple[None, None]:
+    """Return (supervisor_action_key, risk) for tools that should be gated."""
+    action = _SUPERVISOR_TOOL_ACTION_MAP.get(function_name)
+    if action is None and function_name in _SUPERVISOR_SAFE_TOOL_NAMES:
+        return None, None
+    if action is None and function_name.startswith(_SUPERVISOR_SAFE_PREFIXES):
+        return None, None
+    if action is None and function_name.startswith("mcp_") and any(
+        fragment in function_name for fragment in _SUPERVISOR_HIGH_RISK_NAME_FRAGMENTS
+    ):
+        action = "external_send"
+    if action is None:
+        return None, None
+
+    if supervisor_mod is None:
+        supervisor_mod, _ = _supervisor_import_modules()
+    risk = supervisor_mod.risk_for(action)
+    return action, risk
+
+
+def _maybe_apply_supervisor_gate(
+    *,
+    function_name: str,
+    function_args: Dict[str, Any],
+    user_task: Optional[str],
+    task_id: Optional[str],
+    session_id: Optional[str],
+    tool_call_id: Optional[str],
+    turn_id: Optional[str],
+    api_request_id: Optional[str],
+) -> Optional[str]:
+    """Return a JSON block result when the supervisor gate blocks, else None."""
+    if not _supervisor_gate_enabled():
+        return None
+
+    action = "unknown"
+    risk_value = "unknown"
+    try:
+        action = _SUPERVISOR_TOOL_ACTION_MAP.get(function_name)
+        if action is None and function_name in _SUPERVISOR_SAFE_TOOL_NAMES:
+            return None
+        if action is None and function_name.startswith(_SUPERVISOR_SAFE_PREFIXES):
+            return None
+        if action is None and function_name.startswith("mcp_") and any(
+            fragment in function_name for fragment in _SUPERVISOR_HIGH_RISK_NAME_FRAGMENTS
+        ):
+            action = "external_send"
+        if action is None:
+            return None
+
+        # From here onward, the tool is in a potentially risky bucket.  Import
+        # failures are fail-closed for that bucket, but clearly-safe/unmapped
+        # reads and concierge tools above never pay this import/network cost.
+        supervisor_mod, gate_mod = _supervisor_import_modules()
+        risk = supervisor_mod.risk_for(action)
+        risk_value = getattr(risk, "value", str(risk))
+        if risk not in {supervisor_mod.Risk.MEDIUM, supervisor_mod.Risk.HIGH}:
+            return None
+
+        allowlist_match = _supervisor_path_allowlist_match(
+            function_name=function_name,
+            action=action,
+            function_args=function_args,
+            entries=_supervisor_load_path_allowlist(),
+        )
+        if allowlist_match is not None:
+            _supervisor_append_decision({
+                "action": action,
+                "risk": risk_value,
+                "tool": function_name,
+                "verdict": "APPROVE",
+                "blocking": False,
+                "reasoning": "approved by supervisor path allowlist",
+                "issues": [],
+                "wrapper_enforced": True,
+                "allowlist_match": allowlist_match,
+            })
+            return None
+
+        requirement = (
+            user_task.strip()
+            if isinstance(user_task, str) and user_task.strip()
+            else f"Hermes-initiated {function_name} action; no explicit user task provided."
+        )
+        proposed = json.dumps({
+            "tool": function_name,
+            "supervisor_action": action,
+            "risk": risk_value,
+            "arguments": function_args,
+        }, ensure_ascii=False, default=str, indent=2)
+        # Normal command/content payloads stay fully legible.  The cap is only
+        # a last-resort context guard for unusually large write_file/patch args.
+        if len(proposed) > 12000:
+            proposed = proposed[:12000] + "... [truncated]"
+        context = json.dumps({
+            "task_id": task_id or "",
+            "session_id": session_id or "",
+            "tool_call_id": tool_call_id or "",
+            "turn_id": turn_id or "",
+            "api_request_id": api_request_id or "",
+            "note": (
+                "The supervisor is reviewing the exact Hermes tool call before "
+                "dispatch. The proposed JSON contains the full command/content "
+                "unless explicitly marked truncated."
+            ),
+        }, ensure_ascii=False, indent=2)
+
+        try:
+            review = gate_mod.gate(
+                action=action,
+                requirement=requirement,
+                proposed=proposed,
+                context=context,
+                execute=None,
+                risk_override=risk,
+            )
+        except gate_mod.GateBlocked as blocked:
+            review = blocked.review
+            verdict = getattr(getattr(review, "verdict", None), "value", getattr(review, "verdict", ""))
+            reason = f"supervisor returned blocking {verdict or 'ambiguous verdict'}"
+            _supervisor_append_decision({
+                "action": action,
+                "risk": risk_value,
+                "tool": function_name,
+                "verdict": verdict or "AMBIGUOUS",
+                "blocking": True,
+                "reasoning": getattr(review, "reasoning", reason),
+                "issues": list(getattr(review, "issues", []) or []),
+                "wrapper_enforced": True,
+            })
+            return _supervisor_block_result(
+                function_name=function_name,
+                action=action,
+                risk=risk_value,
+                verdict=verdict or "AMBIGUOUS",
+                reason=reason,
+            )
+
+        verdict = getattr(getattr(review, "verdict", None), "value", getattr(review, "verdict", ""))
+        blocking = bool(getattr(review, "blocking", True))
+        if verdict == "APPROVE" and not blocking:
+            return None
+
+        reason = f"supervisor returned {verdict or 'ambiguous verdict'}"
+        _supervisor_append_decision({
+            "action": action,
+            "risk": risk_value,
+            "tool": function_name,
+            "verdict": verdict or "AMBIGUOUS",
+            "blocking": True,
+            "reasoning": getattr(review, "reasoning", reason),
+            "issues": list(getattr(review, "issues", []) or []),
+            "wrapper_enforced": True,
+        })
+        return _supervisor_block_result(
+            function_name=function_name,
+            action=action,
+            risk=risk_value,
+            verdict=verdict or "AMBIGUOUS",
+            reason=reason,
+        )
+    except Exception as exc:
+        reason = f"gate error: {type(exc).__name__}: {exc}"
+        _supervisor_append_decision({
+            "action": action,
+            "risk": risk_value,
+            "tool": function_name,
+            "verdict": "ERROR",
+            "blocking": True,
+            "reasoning": reason,
+            "issues": [reason],
+            "wrapper_enforced": True,
+        })
+        return _supervisor_block_result(
+            function_name=function_name,
+            action=action,
+            risk=risk_value,
+            verdict="ERROR",
+            reason=reason,
+        )
 
 
 # =========================================================================
@@ -1126,6 +1612,33 @@ def handle_function_call(
                         session_id=session_id,
                         user_task=user_task,
                     )
+            supervisor_block = _maybe_apply_supervisor_gate(
+                function_name=function_name,
+                function_args=function_args,
+                user_task=user_task,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+            )
+            if supervisor_block is not None:
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=supervisor_block,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    status="blocked",
+                    error_type="supervisor_gate_block",
+                    error_message=supervisor_block,
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return supervisor_block
+
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(
