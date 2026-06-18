@@ -87,7 +87,7 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
-from utils import atomic_replace
+from utils import atomic_json_write, atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -2093,7 +2093,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._handle_location_message
             ))
             self._app.add_handler(TelegramMessageHandler(
-                filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+                filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
             # Handle inline keyboard button callbacks (update prompts)
@@ -2414,11 +2414,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     should_thread = self._should_thread_reply(reply_to_source, i)
                 reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
                 if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
-                    return SendResult(
-                        success=False,
-                        error=self._dm_topic_missing_anchor_error(),
-                        retryable=False,
+                    # A stale Telegram private-topic/session key can outlive
+                    # the topic itself (or arrive without a usable reply
+                    # anchor). Previously this returned a failure that the
+                    # generic fallback retried with the same bad metadata,
+                    # leaving ordinary DMs silent. Prefer delivery over lane
+                    # fidelity: strip topic routing and send a plain DM.
+                    logger.warning(
+                        "[%s] Private DM topic %s has no usable reply anchor; "
+                        "falling back to plain DM delivery",
+                        self.name,
+                        thread_id,
                     )
+                    thread_id = None
+                    private_dm_topic_send = False
                 thread_kwargs = self._thread_kwargs_for_send(
                     chat_id,
                     thread_id,
@@ -2470,11 +2479,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
                                 if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
-                                    return SendResult(
-                                        success=False,
-                                        error=str(send_err),
-                                        retryable=False,
+                                    logger.warning(
+                                        "[%s] Private DM topic/thread %s not found; "
+                                        "retrying as plain DM delivery",
+                                        self.name,
+                                        effective_thread_id,
                                     )
+                                    used_thread_fallback = True
+                                    effective_thread_id = None
+                                    thread_kwargs = {"message_thread_id": None}
+                                    reply_to_id = None
+                                    private_dm_topic_send = False
+                                    continue
                                 # Telegram has been observed to return a
                                 # one-off "thread not found" that recovers on
                                 # an immediate retry (transient flake — see
@@ -5226,9 +5242,68 @@ class TelegramAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
             raw = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_silent_location_chats(self) -> set[str]:
+        """Return chats whose location pins update state without dispatching a turn.
+
+        Telegram live locations can emit a rapid stream of updates. Treating
+        each update as a user message interrupts active agent turns and creates
+        noisy self-collisions on providers that do not tolerate input/output
+        overlap. Operators can opt specific chats into telemetry-style handling
+        via ``telegram.silent_location_chats`` (comma-separated chat IDs).
+        """
+        raw = self.config.extra.get("silent_location_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_SILENT_LOCATION_CHATS", "")
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_location_state_path(self):
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "state" / "telegram_live_locations.json"
+
+    def _persist_silent_location(self, message: Message, *, lat: Any, lon: Any, venue: Any = None) -> None:
+        """Persist the latest location for a chat/user without calling the agent."""
+        try:
+            path = self._telegram_location_state_path()
+            try:
+                existing = json.loads(path.read_text()) if path.exists() else {}
+            except Exception:
+                existing = {}
+            chat = getattr(message, "chat", None)
+            user = getattr(message, "from_user", None)
+            chat_id = str(getattr(chat, "id", "") or "unknown")
+            user_id = str(getattr(user, "id", "") or "unknown")
+            key = f"telegram:{chat_id}:{user_id}"
+            record = {
+                "platform": "telegram",
+                "chat_id": chat_id,
+                "chat_title": getattr(chat, "title", None) or getattr(chat, "full_name", None),
+                "user_id": user_id,
+                "user_name": getattr(user, "full_name", None),
+                "message_id": str(getattr(message, "message_id", "") or ""),
+                "latitude": lat,
+                "longitude": lon,
+                "map_url": f"https://www.google.com/maps/search/?api=1&query={lat},{lon}",
+                "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+            }
+            if venue:
+                record["venue"] = {
+                    "title": getattr(venue, "title", None),
+                    "address": getattr(venue, "address", None),
+                }
+            existing[key] = record
+            atomic_json_write(path, existing, indent=2)
+            logger.info(
+                "[%s] Telegram location persisted silently: chat=%s user=%s lat=%s lon=%s",
+                self.name,
+                chat_id,
+                user_id,
+                lat,
+                lon,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to persist silent Telegram location: %s", self.name, exc)
 
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
@@ -5619,7 +5694,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return MessageType.STICKER
         if msg.photo:
             return MessageType.PHOTO
-        if msg.video:
+        if msg.video or getattr(msg, "video_note", None):
             return MessageType.VIDEO
         if msg.audio:
             return MessageType.AUDIO
@@ -5732,6 +5807,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return msg.photo[-1], "", "", "image"
         if msg.video:
             return msg.video, "", "video/mp4", "video"
+        if getattr(msg, "video_note", None):
+            return msg.video_note, "video_note.mp4", "video/mp4", "video"
         if msg.voice:
             return msg.voice, "voice.ogg", "audio/ogg", "audio"
         if msg.audio:
@@ -5953,6 +6030,12 @@ class TelegramAdapter(BasePlatformAdapter):
         lat = getattr(location, "latitude", None)
         lon = getattr(location, "longitude", None)
         if lat is None or lon is None:
+            return
+
+        chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
+        silent_location_chats = self._telegram_silent_location_chats()
+        if "*" in silent_location_chats or chat_id in silent_location_chats:
+            self._persist_silent_location(msg, lat=lat, lon=lon, venue=venue)
             return
 
         # Build a text message with coordinates and context
@@ -6221,9 +6304,10 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
 
-        elif msg.video:
+        elif msg.video or getattr(msg, "video_note", None):
             try:
-                file_obj = await msg.video.get_file()
+                video_source = msg.video or msg.video_note
+                file_obj = await video_source.get_file()
                 video_bytes = await file_obj.download_as_bytearray()
                 ext = ".mp4"
                 if getattr(file_obj, "file_path", None):

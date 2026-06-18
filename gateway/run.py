@@ -1620,6 +1620,12 @@ def _build_media_placeholder(event) -> str:
         mtype = media_types[i] if i < len(media_types) else ""
         if mtype.startswith("image/") or getattr(event, "message_type", None) == MessageType.PHOTO:
             parts.append(f"[User sent an image: {url}]")
+        elif mtype.startswith("video/") or getattr(event, "message_type", None) == MessageType.VIDEO:
+            parts.append(
+                f"[The user sent a video attachment saved at: {url}. "
+                "Its content is not inlined here; inspect or process the saved file. "
+                "Do NOT say you did not receive it.]"
+            )
         elif mtype.startswith("audio/"):
             parts.append(f"[User sent audio: {url}]")
         elif mtype.startswith("video/") or getattr(event, "message_type", None) == MessageType.VIDEO:
@@ -6731,6 +6737,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
+        # Family-trip policy: procedural gateway/system notices are backend noise.
+        # Keep them out of Telegram chats unless they are genuinely actionable/critical.
+        # Critical items should be summarized by Lorenzo to Sean/Robert, not dumped to the family group.
+        if getattr(source, "platform", None) and str(source.platform).lower().endswith("telegram"):
+            lowered = (content or "").lower()
+            critical_terms = (
+                "error", "failed", "failure", "expired", "revoked", "not authenticated",
+                "permission", "denied", "blocked", "cannot", "can't", "urgent",
+                "emergency", "action required", "approval required",
+            )
+            procedural_terms = (
+                "system update", "gateway", "self-improvement review", "memory updated",
+                "user profile updated", "home channel", "type /sethome", "notice",
+            )
+            if any(term in lowered for term in procedural_terms) and not any(term in lowered for term in critical_terms):
+                logger.info("Suppressed procedural Telegram platform notice: %s", content[:160])
+                return
+
         adapter = self.adapters.get(source.platform)
         if not adapter:
             return
@@ -8054,10 +8078,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if event.media_urls:
             image_paths = []
             audio_paths = []
+            video_paths = []
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
                     image_paths.append(path)
+                elif mtype.startswith("video/") or event.message_type == MessageType.VIDEO:
+                    video_paths.append(path)
                 # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
                 # MessageType.VOICE = voice message (Opus/OGG) — always STT
                 if event.message_type == MessageType.AUDIO:
@@ -8094,6 +8121,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         message_text,
                         image_paths,
                     )
+
+            if video_paths:
+                from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
+                _notes = []
+                for _vpath in video_paths:
+                    _basename = os.path.basename(_vpath)
+                    _parts = _basename.split("_", 2)
+                    _display = _parts[2] if len(_parts) >= 3 else _basename
+                    _display = re.sub(r'[^\w.\- ]', '_', _display)
+                    _agent_path = _to_agent_path(_vpath)
+                    _notes.append(
+                        f"[The user sent a video attachment: '{_display}'. "
+                        f"It is saved at: {_agent_path}. Its content is not inlined here. "
+                        "If the user's request involves what the video contains, inspect or process "
+                        "the saved file before answering — for example extract frames or use a video "
+                        "analysis tool. Do NOT say you did not receive the video.]"
+                    )
+                if _notes:
+                    message_text = "\n".join(_notes) + f"\n\n{message_text}"
 
             if audio_paths:
                 message_text, _successful_transcripts = await self._enrich_message_with_transcription(
@@ -12196,6 +12242,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.vision_tools import vision_analyze_tool
         from agent.memory_manager import sanitize_context
 
+        try:
+            from gateway.media_ledger import get_auto_assessment, record_auto_assessment
+        except Exception:  # pragma: no cover - defensive fallback
+            get_auto_assessment = None
+            record_auto_assessment = None
+
         analysis_prompt = (
             "Describe everything visible in this image in thorough detail. "
             "Include any text, code, data, objects, people, layout, colors, "
@@ -12205,6 +12257,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enriched_parts = []
         for path in image_paths:
             try:
+                cached_description = None
+                if get_auto_assessment is not None:
+                    try:
+                        cached_description = get_auto_assessment(path)
+                    except Exception as ledger_exc:
+                        logger.debug("media_ledger: assessment lookup failed for %s: %s", path, ledger_exc)
+
+                if cached_description:
+                    logger.debug("media_ledger: reusing cached auto-vision assessment for %s", path)
+                    enriched_parts.append(
+                        f"[The user sent an image~ Here's what I can see:\n{cached_description}]\n"
+                        "[A generic assessment is already available; reuse it unless "
+                        "the user asks for detail, identities are ambiguous, or the task "
+                        "requires closer inspection. If you need a closer look, use "
+                        f"vision_analyze with image_url: {path} ~]"
+                    )
+                    continue
+
                 logger.debug("Auto-analyzing user image: %s", path)
                 result_json = await vision_analyze_tool(
                     image_url=path,
@@ -12213,11 +12283,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")
-                    description = sanitize_context(description)
+                    description = sanitize_context(description).strip()
+                    if record_auto_assessment is not None and description:
+                        try:
+                            record_auto_assessment(path, description)
+                        except Exception as ledger_exc:
+                            logger.debug("media_ledger: assessment record failed for %s: %s", path, ledger_exc)
                     enriched_parts.append(
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
-                        f"[If you need a closer look, use vision_analyze with "
-                        f"image_url: {path} ~]"
+                        "[A generic assessment is already available; reuse it unless "
+                        "the user asks for detail, identities are ambiguous, or the task "
+                        "requires closer inspection. If you need a closer look, use "
+                        f"vision_analyze with image_url: {path} ~]"
                     )
                 else:
                     enriched_parts.append(
@@ -14914,8 +14991,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for queued in pending:
                     _deliver_bg_review_message(queued)
 
-            # Background review delivery — send "💾 Memory updated" etc. to user
+            # Background review delivery — keep backend self-improvement notices out of messaging chats.
+            # The memory/skill updates still happen; this only suppresses the "sausage-making"
+            # notification such as "💾 Self-improvement review: User profile updated".
             def _bg_review_send(message: str) -> None:
+                return
                 if not _status_adapter or not _run_still_current():
                     return
                 if not _bg_review_release.is_set():
