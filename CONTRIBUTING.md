@@ -881,6 +881,20 @@ After the [litellm supply chain compromise](https://github.com/BerriAI/litellm/i
 
 ---
 
+## Maintainer: `@claude` GitHub Action
+
+`.github/workflows/claude.yml` lets anyone `@claude`-mention the [Claude Code](https://claude.ai/code) GitHub app in an issue or PR to have it answer questions or push a fix, using the [`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action). It's inert — the job only runs when a comment/issue actually contains `@claude` — until a repo admin completes setup:
+
+1. Install the [Claude GitHub app](https://github.com/apps/claude) on this repository.
+2. Generate a long-lived token: run `claude setup-token` locally (requires a Claude Pro or Max subscription) and follow the OAuth prompts.
+3. Add the token as a repository secret named `CLAUDE_CODE_OAUTH_TOKEN` (Settings → Secrets and variables → Actions).
+
+This is unrelated to the `ANTHROPIC_TOKEN` / setup-token flow documented in the [Anthropic provider guide](website/docs/integrations/providers.md) — that one authenticates the `hermes` CLI itself against the Anthropic API; this one authenticates the GitHub Action that runs `@claude` requests against this repo's issues and PRs.
+
+Per the [Actions pinning policy](#dependency-pinning-policy-supply-chain-hardening) above, `claude.yml` pins `anthropics/claude-code-action` and `actions/checkout` by commit SHA — bump the SHA (with a version comment) when upgrading.
+
+---
+
 ## Pull Request Process
 
 ### Branch naming
