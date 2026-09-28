@@ -728,6 +728,27 @@ _SUPERVISOR_TOOL_ACTION_MAP = {
     "mcp_era_knowledge__remember": "edit_config",
     "mcp_era_knowledge__forget": "delete",
     "mcp_era_knowledge__reset_pack_questions": "edit_config",
+    # --- Higgsfield generation: private; only references media already inside
+    # Higgsfield. MEDIUM-reviewed (supervisor reads the prompt for consent/scope)
+    # + code spend gate (artifact_spend). Explicit map wins over the fragment set.
+    "mcp_higgsfield_generate_image": "external_generation",
+    "mcp_higgsfield_generate_video": "external_generation",
+    "mcp_higgsfield_generate_audio": "external_generation",
+    "mcp_higgsfield_generate_3d": "external_generation",
+    "mcp_higgsfield_outpaint_image": "external_generation",
+    "mcp_higgsfield_upscale_image": "external_generation",
+    "mcp_higgsfield_upscale_video": "external_generation",
+    "mcp_higgsfield_reframe": "external_generation",
+    "mcp_higgsfield_remove_background": "external_generation",
+    "mcp_higgsfield_motion_control": "external_generation",
+    "mcp_higgsfield_dubbing": "external_generation",
+    "mcp_higgsfield_voice_change": "external_generation",
+    # --- Fresh media ENTERING Higgsfield: hard-blocked in code below. Lorenzo
+    # never uploads; Sean uploads and supplies the media_id.
+    "mcp_higgsfield_media_upload": "external_media_upload",
+    "mcp_higgsfield_media_import_url": "external_media_upload",
+    "mcp_higgsfield_media_upload_widget": "external_media_upload",
+    "mcp_higgsfield_media_confirm": "external_media_upload",
 }
 
 # Explicit fast-path safe tools.  This includes read-only tools, normal
@@ -791,6 +812,100 @@ _SUPERVISOR_HIGH_RISK_NAME_FRAGMENTS = (
 )
 
 
+_SUPERVISOR_CONTEXT_MESSAGES_ENV = "SUPERVISOR_CONTEXT_MESSAGES"
+_SUPERVISOR_CONTEXT_DEFAULT = 12        # tail turns (the action being reviewed)
+_SUPERVISOR_CONTEXT_HEAD = 14           # head turns (where agreements are made)
+_SUPERVISOR_CONTEXT_MSG_CHARS = 600
+_SUPERVISOR_CONTEXT_TOTAL_CHARS = 8000
+
+# The marker the supervisor prompt keys off to decide whether it may reason
+# about intent. Keep it in sync with supervisor.py.
+_SUPERVISOR_CONVERSATION_HEADER = "RECENT CONVERSATION"
+
+
+def _supervisor_context_message_count() -> int:
+    raw = os.getenv(_SUPERVISOR_CONTEXT_MESSAGES_ENV, "")
+    if not str(raw).strip():
+        return _SUPERVISOR_CONTEXT_DEFAULT
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return _SUPERVISOR_CONTEXT_DEFAULT
+
+
+def _supervisor_conversation_excerpt(session_id: Optional[str]) -> List[Dict[str, str]]:
+    """Bounded recent user/assistant turns for `session_id`.
+
+    Read-only connection on purpose: the gateway holds the writing SessionDB and
+    this runs inside a tool call, so we take no locks it cares about. Returns []
+    on any problem — a supervisor with no transcript is the old behaviour, which
+    is safe; an exception here would break every gated tool call, which is not.
+    """
+    tail_limit = _supervisor_context_message_count()
+    if not session_id or tail_limit <= 0:
+        return []
+    try:
+        import sqlite3
+        from hermes_constants import get_hermes_home
+
+        db = get_hermes_home() / "state.db"
+        if not db.exists():
+            return []
+        conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=2.0)
+        try:
+            rows = conn.execute(
+                "SELECT role, content FROM messages "
+                "WHERE session_id = ? AND active = 1 "
+                "AND role IN ('user','assistant') "
+                "ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:  # never break the gate over context
+        logger.debug("supervisor conversation excerpt unavailable: %s", exc)
+        return []
+
+    turns: List[Dict[str, str]] = []
+    for role, content in rows:             # chronological
+        text = content
+        if isinstance(text, (bytes, bytearray)):
+            try:
+                text = text.decode("utf-8", "replace")
+            except Exception:
+                continue
+        text = str(text or "").strip()
+        if not text:
+            continue
+        if len(text) > _SUPERVISOR_CONTEXT_MSG_CHARS:
+            text = text[:_SUPERVISOR_CONTEXT_MSG_CHARS] + "... [truncated]"
+        turns.append({"role": str(role), "text": text})
+
+    head_limit = _SUPERVISOR_CONTEXT_HEAD
+    if len(turns) <= head_limit + tail_limit:
+        selected = turns
+        omitted = 0
+    else:
+        head = turns[:head_limit]
+        tail = turns[-tail_limit:]
+        omitted = len(turns) - len(head) - len(tail)
+        selected = head + [{
+            "role": "system",
+            "text": "[... %d turns omitted from the middle of this session. "
+                    "They existed; they are simply not shown. Do not read this "
+                    "gap as evidence that nothing was said ...]" % omitted,
+        }] + tail
+
+    # Trim from the middle outwards if the budget is still exceeded, so the
+    # opening of the conversation and the action under review both survive.
+    while sum(len(t["text"]) for t in selected) > _SUPERVISOR_CONTEXT_TOTAL_CHARS:
+        mid = len(selected) // 2
+        if len(selected) <= 3:
+            break
+        selected.pop(mid)
+    return selected
+
+
 def _supervisor_gate_enabled() -> bool:
     value = os.getenv(_SUPERVISOR_GATE_ENV, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -828,6 +943,9 @@ def _supervisor_append_decision(record: Dict[str, Any]) -> None:
         logger.warning("failed to append supervisor wrapper decision log: %s", exc)
 
 
+_BLOCK_REASON_DETAIL = True  # forward the reviewer's reasoning to the agent
+
+
 def _supervisor_block_result(
     *,
     function_name: str,
@@ -835,12 +953,32 @@ def _supervisor_block_result(
     risk: str,
     reason: str,
     verdict: str = "BLOCK",
+    reasoning: str = "",
+    issues: Optional[List[str]] = None,
 ) -> str:
+    """Payload handed back to the agent when the gate refuses a call.
+
+    `reasoning` and `issues` are the supervisor's own words. They used to go
+    only to gate_decisions.log, so the agent saw "supervisor returned MODIFY"
+    and had nothing to correct. A MODIFY verdict names a fixable defect; the
+    agent cannot fix what it is not told.
+    """
+    issues = list(issues or [])
+    detail = (reasoning or "").strip()
+
+    headline = f"BLOCKED by supervisor gate ({reason}). Tool {function_name!r} was not executed."
+    if detail:
+        headline += f" Reviewer said: {detail}"
+    if issues:
+        headline += " Specific issues: " + " | ".join(str(i) for i in issues[:5])
+    if verdict == "MODIFY":
+        headline += (
+            " MODIFY means this is fixable: correct exactly the defect named above, "
+            "change nothing else, and submit the single record again."
+        )
+
     return json.dumps({
-        "error": (
-            f"BLOCKED by supervisor gate ({reason}). Tool {function_name!r} "
-            "was not executed."
-        ),
+        "error": headline,
         "status": "blocked",
         "supervisor_gate": {
             "enabled": True,
@@ -849,6 +987,8 @@ def _supervisor_block_result(
             "risk": risk,
             "verdict": verdict,
             "reason": reason,
+            "reasoning": detail,
+            "issues": issues,
         },
     }, ensure_ascii=False)
 
@@ -924,6 +1064,49 @@ def _maybe_apply_supervisor_gate(
         if action is None:
             return None
 
+        # --- Higgsfield artifact gate: code-enforced, runs BEFORE the LLM review.
+        # Uploads hard-block; generation passes the spend ceiling, then the
+        # MEDIUM supervisor review reads the prompt against the SOUL consent ledger.
+        if action == "external_media_upload":
+            _supervisor_append_decision({
+                "action": action, "risk": "high", "tool": function_name,
+                "verdict": "REJECT", "blocking": True,
+                "reasoning": "Lorenzo does not upload media; Sean uploads and supplies the media_id.",
+                "issues": ["external_media_upload hard-blocked in code"],
+                "wrapper_enforced": True,
+            })
+            return _supervisor_block_result(
+                function_name=function_name, action=action, risk="high",
+                verdict="REJECT",
+                reason=("Lorenzo doesn't upload media. Describe it in text, or Sean "
+                        "uploads it and gives you the media_id."),
+            )
+        if action == "external_generation":
+            try:
+                import artifact_spend
+                _spend = artifact_spend.evaluate_and_record(
+                    tool_name=function_name, function_args=function_args,
+                )
+                _spend_allowed = bool(_spend.allowed)
+                _spend_reason = _spend.reason
+                _spend_log = _spend.as_log()
+            except Exception as _spend_exc:  # fail closed on spend-gate error
+                _spend_allowed = False
+                _spend_reason = f"spend gate error: {type(_spend_exc).__name__}: {_spend_exc}"
+                _spend_log = None
+            if not _spend_allowed:
+                _supervisor_append_decision({
+                    "action": action, "risk": "medium", "tool": function_name,
+                    "verdict": "REJECT", "blocking": True,
+                    "reasoning": _spend_reason, "issues": [_spend_reason],
+                    "wrapper_enforced": True, "spend": _spend_log,
+                })
+                return _supervisor_block_result(
+                    function_name=function_name, action=action, risk="medium",
+                    verdict="REJECT", reason=_spend_reason,
+                )
+            # allowed -> fall through to the MEDIUM supervisor review below.
+
         # From here onward, the tool is in a potentially risky bucket.  Import
         # failures are fail-closed for that bucket, but clearly-safe/unmapped
         # reads and concierge tools above never pay this import/network cost.
@@ -968,7 +1151,8 @@ def _maybe_apply_supervisor_gate(
         # a last-resort context guard for unusually large write_file/patch args.
         if len(proposed) > 12000:
             proposed = proposed[:12000] + "... [truncated]"
-        context = json.dumps({
+        conversation = _supervisor_conversation_excerpt(session_id)
+        context_payload = {
             "task_id": task_id or "",
             "session_id": session_id or "",
             "tool_call_id": tool_call_id or "",
@@ -979,7 +1163,17 @@ def _maybe_apply_supervisor_gate(
                 "dispatch. The proposed JSON contains the full command/content "
                 "unless explicitly marked truncated."
             ),
-        }, ensure_ascii=False, indent=2)
+        }
+        if conversation:
+            context_payload[_SUPERVISOR_CONVERSATION_HEADER] = {
+                "note": (
+                    "The last %d user/assistant turns of this session, oldest "
+                    "first, each capped for length. This is real transcript: "
+                    "judge what was actually asked for against it."
+                ) % len(conversation),
+                "turns": conversation,
+            }
+        context = json.dumps(context_payload, ensure_ascii=False, indent=2)
 
         try:
             review = gate_mod.gate(
@@ -1010,6 +1204,8 @@ def _maybe_apply_supervisor_gate(
                 risk=risk_value,
                 verdict=verdict or "AMBIGUOUS",
                 reason=reason,
+                reasoning=getattr(review, "reasoning", "") or "",
+                issues=list(getattr(review, "issues", []) or []),
             )
 
         verdict = getattr(getattr(review, "verdict", None), "value", getattr(review, "verdict", ""))
@@ -1034,6 +1230,8 @@ def _maybe_apply_supervisor_gate(
             risk=risk_value,
             verdict=verdict or "AMBIGUOUS",
             reason=reason,
+            reasoning=getattr(review, "reasoning", "") or "",
+            issues=list(getattr(review, "issues", []) or []),
         )
     except Exception as exc:
         reason = f"gate error: {type(exc).__name__}: {exc}"
