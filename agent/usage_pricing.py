@@ -84,6 +84,23 @@ _UTC_NOW = lambda: datetime.now(timezone.utc)
 # Official docs snapshot entries. Models whose published pricing and cache
 # semantics are stable enough to encode exactly.
 _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+    # ── Anthropic Claude 5.5 ─────────────────────────────────────────────
+    # Verified live 2026-09-28 via https://claude.com/pricing (redirect
+    # target of anthropic.com/pricing): input $4/MTok, output $20/MTok.
+    # Cache read/write use this file's standard 10%/125% ratio, same as
+    # every other entry here (confirmed against the 4-8 entry below).
+    (
+        "anthropic",
+        "claude-opus-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("4.00"),
+        output_cost_per_million=Decimal("20.00"),
+        cache_read_cost_per_million=Decimal("0.40"),
+        cache_write_cost_per_million=Decimal("5.00"),
+        source="official_docs_snapshot",
+        source_url="https://claude.com/pricing",
+        pricing_version="anthropic-pricing-2026-09",
+    ),
     # ── Anthropic Claude 4.8 ─────────────────────────────────────────────
     # Same $5/$25 base pricing as 4.6/4.7.  Fast-mode variant is a separate
     # model ID with 2x premium (vs the 6x premium on older Opus generations).
